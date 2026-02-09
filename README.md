@@ -1,4 +1,4 @@
-# EPSPG WHMCS
+# EPS WHMCS
 
 Official WHMCS payment gateway module for **EPS (Easy Payment System)**.
 
