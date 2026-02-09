@@ -1,6 +1,6 @@
 # EPSPG WHMCS
 
-Official WHMCS payment gateway module for **EPSPG (Easy Payment System)**.
+Official WHMCS payment gateway module for **EPS (Easy Payment System)**.
 
 ## Features
 - Sandbox & Live mode support  
