@@ -31,6 +31,9 @@ class EPSClient
 {
     private $base, $user, $pass, $key, $merchant, $store;
 
+    /** Per-request timings (for the Gateway Log when something is slow). */
+    public $timings = [];
+
     public function __construct(array $p)
     {
         $this->base = ($p['testmode'] ?? '') === 'on' ? 'https://sandboxpgapi.eps.com.bd' : 'https://pgapi.eps.com.bd';
@@ -74,9 +77,13 @@ class EPSClient
         $raw = curl_exec($ch);
         $err = curl_error($ch);
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $where = strtok($path, '?');
+        $this->timings[] = sprintf('%s: total %.1fs (dns %.1f, connect %.1f, tls %.1f, EPS wait %.1f)', $where,
+            curl_getinfo($ch, CURLINFO_TOTAL_TIME), curl_getinfo($ch, CURLINFO_NAMELOOKUP_TIME),
+            curl_getinfo($ch, CURLINFO_CONNECT_TIME), curl_getinfo($ch, CURLINFO_APPCONNECT_TIME),
+            curl_getinfo($ch, CURLINFO_STARTTRANSFER_TIME) - curl_getinfo($ch, CURLINFO_PRETRANSFER_TIME));
         curl_close($ch);
 
-        $where = strtok($path, '?');
         if ($raw === false) {
             throw new EPSException("EPS connection error on $where: $err", 0, true);
         }

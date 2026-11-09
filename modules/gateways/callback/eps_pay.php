@@ -130,6 +130,7 @@ try {
         ]],
     ];
 
+    $startedAt = microtime(true);
     $client = new EPSClient($gateway); // validates settings before anything is written
 
     // Row first: if EPS creates the transaction but the response is lost, the cron can still settle it.
@@ -153,6 +154,9 @@ try {
         throw $e;
     }
     eps_set_status($rowId, 'pending', ['redirect_url' => $res->RedirectURL]);
+    if ((microtime(true) - $startedAt) > 5) {
+        logTransaction($gateway['name'], ['invoice' => $invoiceId, 'timings' => $client->timings], 'Slow Init');
+    }
 
     header('Location: ' . $res->RedirectURL);
     exit;
