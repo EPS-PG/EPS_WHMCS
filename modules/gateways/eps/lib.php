@@ -77,6 +77,7 @@ class EPSClient
         $raw = curl_exec($ch);
         $err = curl_error($ch);
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $redir = (string)curl_getinfo($ch, CURLINFO_REDIRECT_URL);
         $where = strtok($path, '?');
         $this->timings[] = sprintf('%s: total %.1fs (dns %.1f, connect %.1f, tls %.1f, EPS wait %.1f)', $where,
             curl_getinfo($ch, CURLINFO_TOTAL_TIME), curl_getinfo($ch, CURLINFO_NAMELOOKUP_TIME),
@@ -92,7 +93,8 @@ class EPSClient
         }
         $json = json_decode($raw);
         if (!is_object($json)) {
-            throw new EPSException("EPS returned an invalid response on $where", $code, true);
+            throw new EPSException("EPS returned an invalid response on $where (HTTP $code, redirect: $redir, body: "
+                . substr(trim(strip_tags((string)$raw)), 0, 200) . ')', $code, true);
         }
         return $json;
     }
@@ -240,6 +242,12 @@ function eps_ensure_table()
         });
     }
     if ($s->hasTable(EPS_TABLE)) {
+        // upgrade path: tables created by older versions lack `note`
+        if (!$s->hasColumn(EPS_TABLE, 'note')) {
+            $s->table(EPS_TABLE, function ($t) {
+                $t->string('note', 255)->nullable();
+            });
+        }
         return;
     }
     $s->create(EPS_TABLE, function ($t) {
@@ -251,6 +259,7 @@ function eps_ensure_table()
         $t->decimal('eps_amount', 14, 2);
         $t->text('redirect_url')->nullable();
         $t->string('status', 20)->default('pending')->index();
+        $t->string('note', 255)->nullable();
         $t->dateTime('created_at');
         $t->dateTime('updated_at');
     });
