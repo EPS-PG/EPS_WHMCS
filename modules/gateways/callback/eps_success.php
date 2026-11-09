@@ -1,50 +1,32 @@
 <?php
+/**
+ * EPS return URL (success, fail and cancel all land here).
+ * Nothing in the query string is trusted: the transaction is looked up in our own table
+ * and the result is re-verified server-side with EPS before any payment is recorded.
+ */
+use WHMCS\Database\Capsule;
 
-require_once '../../../init.php';
-require_once '../../../includes/gatewayfunctions.php';
-require_once '../../../includes/invoicefunctions.php';
+require_once __DIR__ . '/../../../init.php';
+require_once ROOTDIR . '/includes/gatewayfunctions.php';
+require_once ROOTDIR . '/includes/invoicefunctions.php';
+require_once __DIR__ . '/../eps/lib.php';
 
-$gatewaymodule = "eps"; # Enter your gateway module name here replacing template
+$gateway = getGatewayVariables('eps');
+if (empty($gateway['type'])) {
+    die("Module Not Activated");
+}
+$systemurl = rtrim($gateway['systemurl'], '/');
 
+eps_ensure_table();
+$tx = preg_replace('/[^A-Za-z0-9\-]/', '', (string)($_GET['tx'] ?? ''));
+$row = $tx === '' ? null : Capsule::table(EPS_TABLE)->where('merchant_tx', $tx)->first();
 
-$GATEWAY = getGatewayVariables($gatewaymodule);
-
-if (!$GATEWAY["type"]){
-	die("Module Not Activated"); # Checks gateway module is active before accepting callback
+if (!$row) {
+    logTransaction($gateway['name'], $_GET, 'Unknown Transaction');
+    header('Location: ' . $systemurl . '/clientarea.php?action=invoices');
+    exit;
 }
 
-// Process callback data
-
-$invoiceid = $_GET['invoiceid'];
-$tran_id = $_GET["MerchantTransactionId"];
-
-
-$store_id = $GATEWAY["store_id"];
-$store_passwd = $GATEWAY["store_password"];
-$systemurl = rtrim($GATEWAY['systemurl'], '/');
-$status = $_GET['Status'];
-$base_amount=$_GET['amount'];
-
-if ($_GET['Status'] == 'Success') {
-	
-	checkCbInvoiceID($invoiceid, $GATEWAY["name"]); # Checks invoice ID is a valid invoice number or ends processing
-
-
-	if ($status == "Success") {
-		$fee = 0;
-		addInvoicePayment($invoiceid, $tran_id, $base_amount, $fee, $gatewaymodule);
-		logTransaction($GATEWAY["name"], $_GET, "Successful"); # Save to Gateway Log: name, data array, status
-		header("Location: " . $systemurl . "/clientarea.php?action=services"); /* Redirect browser */
-		exit();
-
-	} else {
-		logTransaction($GATEWAY["name"], $_GET, "Unsuccessful"); # Save to Gateway Log: name, data array, status
-		header("Location: " . $systemurl . "/clientarea.php?action=services"); /* Redirect browser */
-		exit();
-	}
-
-} else {
-	logTransaction($GATEWAY["name"], $_GET, "Unsuccessful"); # Save to Gateway Log: name, data array, status
-	header("Location: " . $systemurl . "/clientarea.php?action=services"); /* Redirect browser */
-	exit();
-}
+$result = eps_settle($gateway, $row, (string)($_GET['Status'] ?? ''));
+header('Location: ' . $systemurl . '/viewinvoice.php?id=' . (int)$row->invoice_id . '&epsstatus=' . $result);
+exit;
