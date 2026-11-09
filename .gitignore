@@ -1,0 +1,5 @@
+# Graphify
+graphify-out/
+.graphify/
+.graphify*
+
