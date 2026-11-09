@@ -17,12 +17,12 @@ add_hook('AfterCronJob', 1, function () {
     }
 
     // Abandoned attempts.
-    Capsule::table(EPS_TABLE)->where('status', 'pending')
+    Capsule::table(EPS_TABLE)->whereIn('status', ['initiating', 'pending'])
         ->where('created_at', '<', date('Y-m-d H:i:s', time() - EPS_STALE_SECONDS))
         ->update(['status' => 'expired', 'updated_at' => date('Y-m-d H:i:s')]);
 
     // Give the customer 5 minutes to finish before we poll.
-    $rows = Capsule::table(EPS_TABLE)->whereIn('status', ['pending', 'processing'])
+    $rows = Capsule::table(EPS_TABLE)->whereIn('status', ['initiating', 'pending', 'processing'])
         ->where('updated_at', '<', date('Y-m-d H:i:s', time() - 300))
         ->orderBy('id')->limit(50)->get();
     foreach ($rows as $row) {
@@ -43,7 +43,7 @@ add_hook('ClientAreaFooterOutput', 1, function ($vars) {
         'mismatch' => ['danger', 'The paid amount did not match the invoice. Please contact support with your payment details.'],
         'error' => ['warning', 'We could not confirm your payment right now. If you paid, this invoice will update automatically; do not pay again.'],
         'phone' => ['warning', 'Please add a valid mobile number to your account profile, then try again.'],
-        'init' => ['danger', 'The payment gateway is temporarily unavailable. Please try again in a few minutes.'],
+        'init' => ['danger', 'The payment gateway is temporarily unavailable. Please try again in a few minutes. If it keeps happening, contact support.'],
     ];
     $key = (string)$_GET['epsstatus'];
     if (!isset($messages[$key])) {

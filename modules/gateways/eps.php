@@ -27,7 +27,7 @@ function eps_config()
         "button_text" => array("FriendlyName" => "Payment Button Label", "Type" => "text", "Size" => "50", 'Default' => 'Proceed to Payment'),
         "user_name" => array("FriendlyName" => "Username", "Type" => "text", "Size" => "100"),
         "user_password" => array("FriendlyName" => "Password", "Type" => "password", "Size" => "100"),
-        "hashkey" => array("FriendlyName" => "Hash key", "Type" => "password", "Size" => "100"),
+        "hashkey" => array("FriendlyName" => "Hash key", "Type" => "text", "Size" => "100"),
         "merchent_id" => array("FriendlyName" => "Merchant ID", "Type" => "text", "Size" => "100"),
         "store_id" => array("FriendlyName" => "Store ID", "Type" => "text", "Size" => "100"),
         "testmode" => array("FriendlyName" => "Enable Sandbox / Testmode?", "Type" => "yesno", "Description" => "Choose 'NO' in live environment."),

@@ -53,7 +53,7 @@ try {
     }
 
     // 2. An older attempt may have been paid without the customer returning: apply it, don't charge twice.
-    $older = Capsule::table(EPS_TABLE)->where('invoice_id', $invoiceId)->whereIn('status', ['pending', 'processing'])
+    $older = Capsule::table(EPS_TABLE)->where('invoice_id', $invoiceId)->whereIn('status', ['initiating', 'pending', 'processing'])
         ->where('created_at', '>', date('Y-m-d H:i:s', time() - EPS_STALE_SECONDS))
         ->orderBy('id', 'desc')->limit(3)->get();
     foreach ($older as $row) {
@@ -130,15 +130,29 @@ try {
         ]],
     ];
 
-    $res = (new EPSClient($gateway))->initialize($tx, $payload);
+    $client = new EPSClient($gateway); // validates settings before anything is written
 
+    // Row first: if EPS creates the transaction but the response is lost, the cron can still settle it.
     $now = date('Y-m-d H:i:s');
-    Capsule::table(EPS_TABLE)->insert([
+    $rowId = Capsule::table(EPS_TABLE)->insertGetId([
         'invoice_id' => $invoiceId, 'merchant_tx' => $tx, 'eps_tx' => null,
         'invoice_amount' => $balance, 'eps_amount' => $epsAmount,
-        'redirect_url' => $res->RedirectURL, 'status' => 'pending',
+        'redirect_url' => null, 'status' => 'initiating',
         'created_at' => $now, 'updated_at' => $now,
     ]);
+
+    try {
+        $res = $client->initialize($tx, $payload);
+    } catch (EPSException $e) {
+        // A definite rejection or auth error means no transaction exists. A timeout is ambiguous: keep the row.
+        if (!$e->transient && $e->httpCode !== 0) {
+            eps_set_status($rowId, 'failed', ['note' => mb_substr($e->getMessage(), 0, 250)]);
+        } else {
+            eps_set_status($rowId, 'initiating', ['note' => mb_substr($e->getMessage(), 0, 250)]);
+        }
+        throw $e;
+    }
+    eps_set_status($rowId, 'pending', ['redirect_url' => $res->RedirectURL]);
 
     header('Location: ' . $res->RedirectURL);
     exit;

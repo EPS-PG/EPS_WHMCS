@@ -12,6 +12,20 @@ use WHMCS\Database\Capsule;
 const EPS_TABLE = 'mod_eps_transactions';
 const EPS_TRANSACTION_TYPE_ID = 5; // value used by the working production copy; API guide lists 1 = Web
 const EPS_STALE_SECONDS = 259200;  // pending tx older than 3 days are expired
+const EPS_TOKEN_TABLE = 'mod_eps_token';
+
+class EPSException extends RuntimeException
+{
+    public $httpCode;
+    public $transient;
+
+    public function __construct($message, $httpCode = 0, $transient = false)
+    {
+        parent::__construct($message);
+        $this->httpCode = $httpCode;
+        $this->transient = $transient;
+    }
+}
 
 class EPSClient
 {
@@ -25,8 +39,14 @@ class EPSClient
         $this->key = trim($p['hashkey'] ?? '');
         $this->merchant = trim($p['merchent_id'] ?? '');
         $this->store = trim($p['store_id'] ?? '');
-        if (!$this->user || !$this->pass || !$this->key || !$this->merchant || !$this->store) {
-            throw new RuntimeException('EPS gateway is not fully configured');
+        foreach (['Username' => $this->user, 'Password' => $this->pass, 'Hash key' => $this->key,
+                  'Merchant ID' => $this->merchant, 'Store ID' => $this->store] as $label => $v) {
+            if ($v === '') {
+                throw new RuntimeException("EPS setting '$label' is empty - re-enter it in the gateway settings");
+            }
+            if (!preg_match('/^[\x20-\x7e]+$/', $v) || preg_match('/^\*{3,}$/', $v)) {
+                throw new RuntimeException("EPS setting '$label' is unreadable or masked - re-enter it in the gateway settings");
+            }
         }
     }
 
@@ -35,15 +55,17 @@ class EPSClient
         return base64_encode(hash_hmac('sha512', (string)$data, (string)$key, true));
     }
 
-    private function call($method, $path, array $headers, $body = null)
+    private function call($method, $path, array $headers, $body = null, $timeout = 20)
     {
         $ch = curl_init($this->base . $path);
         $opt = [
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_CONNECTTIMEOUT => 5,
-            CURLOPT_TIMEOUT => 20,
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1, // what the earlier working copy used
             CURLOPT_CUSTOMREQUEST => $method,
-            CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json'], $headers),
+            // empty Expect: stops curl waiting on "100-continue" for bodies over 1 KB
+            CURLOPT_HTTPHEADER => array_merge(['Content-Type: application/json', 'Expect:'], $headers),
         ];
         if ($body !== null) {
             $opt[CURLOPT_POSTFIELDS] = json_encode($body, JSON_INVALID_UTF8_SUBSTITUTE);
@@ -54,35 +76,92 @@ class EPSClient
         $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
         curl_close($ch);
 
+        $where = strtok($path, '?');
         if ($raw === false) {
-            throw new RuntimeException("EPS connection error: $err");
+            throw new EPSException("EPS connection error on $where: $err", 0, true);
         }
         if ($code >= 400) {
-            throw new RuntimeException("EPS HTTP $code: " . substr($raw, 0, 200));
+            throw new EPSException("EPS HTTP $code on $where: " . substr($raw, 0, 200), $code, $code >= 500 || $code === 429);
         }
         $json = json_decode($raw);
         if (!is_object($json)) {
-            throw new RuntimeException('EPS returned an invalid response');
+            throw new EPSException("EPS returned an invalid response on $where", $code, true);
         }
         return $json;
     }
 
-    private static $tokens = [];
-
-    private function token()
+    /** Run $fn; retry once after 1s only for transient failures (timeout, 5xx, 429). Never for auth errors. */
+    private function withRetry(callable $fn)
     {
-        $k = $this->base . $this->user;
-        if (isset(self::$tokens[$k]) && self::$tokens[$k][1] > time()) {
-            return self::$tokens[$k][0];
+        try {
+            return $fn();
+        } catch (EPSException $e) {
+            if (!$e->transient) {
+                throw $e;
+            }
+            sleep(1);
+            return $fn();
         }
-        $r = $this->call('POST', '/v1/Auth/GetToken',
-            ['x-hash: ' . self::hash($this->user, $this->key)],
-            ['userName' => $this->user, 'password' => $this->pass]);
+    }
+
+    private function cacheKey()
+    {
+        return sha1($this->base . '|' . $this->user . '|' . $this->key);
+    }
+
+    /** Token cached in the DB until just before it expires; shared by Pay clicks and the cron. */
+    private function token($fresh = false)
+    {
+        $k = $this->cacheKey();
+        if (!$fresh) {
+            try {
+                $row = Capsule::table(EPS_TOKEN_TABLE)->where('k', $k)->first();
+                if ($row && strtotime($row->expires_at) > time() + 60) {
+                    return $row->token;
+                }
+            } catch (Exception $e) {
+                // cache is an optimisation only
+            }
+        }
+        $r = $this->withRetry(function () {
+            return $this->call('POST', '/v1/Auth/GetToken',
+                ['x-hash: ' . self::hash($this->user, $this->key)],
+                ['userName' => $this->user, 'password' => $this->pass]);
+        });
         if (empty($r->token)) {
-            throw new RuntimeException('EPS auth failed: ' . ($r->errorMessage ?? 'no token'));
+            // EPS answers HTTP 200 + errorMessage for a wrong user/password/hash key.
+            throw new EPSException('EPS auth failed (check Username, Password and Hash key in gateway settings): '
+                . ($r->errorMessage ?? 'no token'), 200, false);
         }
-        self::$tokens[$k] = [$r->token, time() + 240];
+        $exp = !empty($r->expireDate) ? strtotime($r->expireDate . ' UTC') : 0;
+        if ($exp < time() + 120) {
+            $exp = time() + 600; // unknown/odd expiry: keep it short
+        }
+        try {
+            Capsule::table(EPS_TOKEN_TABLE)->updateOrInsert(['k' => $k],
+                ['token' => $r->token, 'expires_at' => date('Y-m-d H:i:s', $exp - 60)]);
+        } catch (Exception $e) {
+        }
         return $r->token;
+    }
+
+    /** Authenticated call; on HTTP 401 the cached token was stale: refresh once. */
+    private function authed($method, $path, $hashData, $body, $timeout)
+    {
+        $try = function ($fresh) use ($method, $path, $hashData, $body, $timeout) {
+            return $this->call($method, $path, [
+                'x-hash: ' . self::hash($hashData, $this->key),
+                'Authorization: Bearer ' . $this->token($fresh),
+            ], $body, $timeout);
+        };
+        try {
+            return $try(false);
+        } catch (EPSException $e) {
+            if ($e->httpCode !== 401) {
+                throw $e;
+            }
+            return $try(true);
+        }
     }
 
     /** @return object with TransactionId + RedirectURL (validated) */
@@ -101,26 +180,24 @@ class EPSClient
             'merchantTransactionId' => (string)$merchantTxId,
         ], $payload);
 
-        $r = $this->call('POST', '/v1/EPSEngine/InitializeEPS', [
-            'x-hash: ' . self::hash($merchantTxId, $this->key),
-            'Authorization: Bearer ' . $this->token(),
-        ], $body);
+        // Not retried: InitializeEPS is not idempotent. A new attempt gets a new transaction id.
+        $r = $this->authed('POST', '/v1/EPSEngine/InitializeEPS', $merchantTxId, $body, 45);
 
         $host = empty($r->RedirectURL) ? '' : strtolower((string)parse_url($r->RedirectURL, PHP_URL_HOST));
         $scheme = empty($r->RedirectURL) ? '' : parse_url($r->RedirectURL, PHP_URL_SCHEME);
         if ($scheme !== 'https' || !preg_match('/(^|\.)eps\.com\.bd$/', $host)) {
-            throw new RuntimeException('EPS init failed: ' . ($r->ErrorMessage ?? 'no/invalid RedirectURL'));
+            throw new EPSException('EPS rejected the request: ' . ($r->ErrorMessage ?? 'no/invalid RedirectURL'), 200, false);
         }
         return $r;
     }
 
     public function status($merchantTxId)
     {
-        return $this->call('GET',
-            '/v1/EPSEngine/CheckMerchantTransactionStatus?merchantTransactionId=' . rawurlencode($merchantTxId), [
-                'x-hash: ' . self::hash($merchantTxId, $this->key),
-                'Authorization: Bearer ' . $this->token(),
-            ]);
+        return $this->withRetry(function () use ($merchantTxId) {
+            return $this->authed('GET',
+                '/v1/EPSEngine/CheckMerchantTransactionStatus?merchantTransactionId=' . rawurlencode($merchantTxId),
+                $merchantTxId, null, 20);
+        });
     }
 }
 
@@ -148,6 +225,13 @@ function eps_amount_ok($a, $b)
 function eps_ensure_table()
 {
     $s = Capsule::schema();
+    if (!$s->hasTable(EPS_TOKEN_TABLE)) {
+        $s->create(EPS_TOKEN_TABLE, function ($t) {
+            $t->string('k', 40)->primary();
+            $t->text('token');
+            $t->dateTime('expires_at');
+        });
+    }
     if ($s->hasTable(EPS_TABLE)) {
         return;
     }
@@ -205,7 +289,7 @@ function eps_settle(array $gateway, $row, $hint = '')
             // Hint comes from the URL (spoofable): used for the message only, never stored.
             return eps_classify($hint) === 'cancelled' ? 'cancelled' : 'pending';
         }
-        eps_set_status($row->id, $result, [], ['pending']);
+        eps_set_status($row->id, $result, [], ['initiating', 'pending']);
         logTransaction($name, $log, $result === 'cancelled' ? 'Cancelled' : 'Unsuccessful');
         return $result;
     }
