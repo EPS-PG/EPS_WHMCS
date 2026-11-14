@@ -88,6 +88,11 @@ class EPSClient
         if ($raw === false) {
             throw new EPSException("EPS connection error on $where: $err", 0, true);
         }
+        // EPS (ASP.NET Identity) rejects a bad/expired Bearer token with a 302 to its login page, not a 401.
+        // Normalise every auth rejection to 401 so authed() refreshes the token once.
+        if ($code === 401 || $code === 403 || ($code >= 300 && $code < 400 && stripos($redir, '/Account/Login') !== false)) {
+            throw new EPSException("EPS rejected the token on $where (HTTP $code, redirect: $redir)", 401, false);
+        }
         if ($code >= 400) {
             throw new EPSException("EPS HTTP $code on $where: " . substr($raw, 0, 200), $code, $code >= 500 || $code === 429);
         }
@@ -115,7 +120,7 @@ class EPSClient
 
     private function cacheKey()
     {
-        return sha1($this->base . '|' . $this->user . '|' . $this->key);
+        return sha1($this->base . '|' . $this->user . '|' . $this->pass . '|' . $this->key);
     }
 
     /** Token cached in the DB until just before it expires; shared by Pay clicks and the cron. */
@@ -142,10 +147,9 @@ class EPSClient
             throw new EPSException('EPS auth failed (check Username, Password and Hash key in gateway settings): '
                 . ($r->errorMessage ?? 'no token'), 200, false);
         }
+        // expireDate's timezone is not reliable (a wrong one kept dead tokens cached): never cache beyond 10 min.
         $exp = !empty($r->expireDate) ? strtotime($r->expireDate . ' UTC') : 0;
-        if ($exp < time() + 120) {
-            $exp = time() + 600; // unknown/odd expiry: keep it short
-        }
+        $exp = ($exp < time() + 120) ? time() + 600 : min($exp, time() + 600);
         try {
             Capsule::table(EPS_TOKEN_TABLE)->updateOrInsert(['k' => $k],
                 ['token' => $r->token, 'expires_at' => date('Y-m-d H:i:s', $exp - 60)]);
